@@ -1,0 +1,126 @@
+import pandas as pd
+import numpy as np
+import seaborn as sns
+from sklearn.model_selection import KFold
+import lightgbm as lgb
+
+#训练集和测试集的读取
+train = pd.read_csv('../data/train.csv', encoding="gbk")#encoding="gbk"解决读取的文件中有中文的问题
+test = pd.read_csv('../data/test.csv', encoding="gbk")#encoding="gbk"解决读取的文件中有中文的问题
+#查看训练集和测试集字段类型
+print(train.shape,test.shape)
+print(train.dtypes,test.dtypes)
+#统计字段缺失值，计算缺失比例
+#x.isnull().mean(0)
+#数据值为0的也是缺失，把其统一为空
+c=['体重指数','舒张压','口服耐糖量测试','胰岛素释放实验','肱三头肌皮褶厚度']
+for col in c:
+    train[col] = train[col].replace(0,np.nan)
+    test[col] = test[col].replace(0,np.nan)
+# 计算并输出缺失值比例train:a,test:b
+a = train.isnull().sum() / len(train) * 100
+b = test.isnull().sum() / len(test) * 100
+print('train_data',a)
+print('test_data',b)
+cols_a = train.columns  # 列名
+cols_b = test.columns  # 列名
+train_col = []
+test_col = []
+#train比test多一列标签数据，缺失情况可以不考虑标签，所以循环长度按照test.shape[1]
+for i in range(test.shape[1]):
+    if a[i] <= 50:  # 缺失值阈值为50%
+        train_col.append(cols_a[i])
+    if b[i] <= 50:  # 缺失值阈值为50%
+        test_col.append(cols_b[i])
+#最后把训练集的标签列加上
+train_col.append(cols_a[i+1])
+print("训练集缺失值低于阈值的特征共%d个；" % len(train_col), "\n它们分别是：", train_col)
+print("测试集缺失值低于阈值的特征共%d个；" % len(test_col), "\n它们分别是：", test_col)
+train = train[train_col]    #保留缺失值少的col列
+test = test[test_col]
+# print('删除后数据')
+# print(train[0:5])
+#相关性计算
+print(train.corr())
+
+#特征工程
+#1.---前期数据处理----对字段进行编码
+train['体重指数_round'] = train['体重指数']//10
+test['体重指数_round'] = test['体重指数']//10
+
+train['口服耐糖量测试'] = train['口服耐糖量测试'].replace(-1,np.nan)
+test['口服耐糖量测试'] = test['口服耐糖量测试'].replace(-1,np.nan)
+#定义一个字典
+dict_糖尿病家族史 = {
+    '无记录':0,
+    '叔叔或姑姑有一方患有糖尿病':1,
+    '叔叔或者姑姑有一方患有糖尿病':1,
+    '父母有一方患有糖尿病':2,
+}
+#添加字典map为新增的特征（与样本特征个数一样多）=transform
+train['糖尿病家族史'] = train['糖尿病家族史'].map(dict_糖尿病家族史)
+test['糖尿病家族史'] = test['糖尿病家族史'].map(dict_糖尿病家族史)
+
+#astype（）函数：实现变量类型转换
+# a = a.astype('Float64')
+# b = b.astype('Int32')
+
+# 这里的astype('category')是转换为分类数据
+train['糖尿病家族史'] = train['糖尿病家族史'].astype('category')
+test['糖尿病家族史'] = test['糖尿病家族史'].astype('category')
+#
+train['性别'] = train['性别'].astype('category')
+test['性别'] = test['性别'].astype('category')
+#把出生年份转换成年龄
+train['年龄'] = 2022 - train['出生年份']
+test['年龄'] = 2022 - test['出生年份']
+#groupby（）函数表示对某一列进行聚合
+train['口服耐糖量测试_diff'] = train['口服耐糖量测试'] - train.groupby('糖尿病家族史').transform('mean')['口服耐糖量测试']
+test['口服耐糖量测试_diff'] = test['口服耐糖量测试'] - test.groupby('糖尿病家族史').transform('mean')['口服耐糖量测试']
+
+print(train)
+
+# 模型交叉验证
+def run_model_cv(model, kf, X_tr, y, X_te, cate_col=None):
+    train_pred = np.zeros( (len(X_tr), len(np.unique(y))) )
+    test_pred = np.zeros( (len(X_te), len(np.unique(y))) )
+
+    cv_clf = []
+    for tr_idx, val_idx in kf.split(X_tr, y):
+        x_tr = X_tr.iloc[tr_idx]; y_tr = y.iloc[tr_idx]
+
+        x_val = X_tr.iloc[val_idx]; y_val = y.iloc[val_idx]
+
+        call_back = [
+            lgb.early_stopping(50),
+        ]
+        eval_set = [(x_val, y_val)]
+        model.fit(x_tr, y_tr, eval_set=eval_set, callbacks=call_back, verbose=-1)
+
+        cv_clf.append(model)
+
+        train_pred[val_idx] = model.predict_proba(x_val)
+        test_pred += model.predict_proba(X_te)
+
+    test_pred /= kf.n_splits
+    return train_pred, test_pred, cv_clf
+
+clf = lgb.LGBMClassifier(
+    max_depth=3,
+    n_estimators=4000,
+    n_jobs=-1,
+    verbose=-1,
+    verbosity=-1,
+    learning_rate=0.1,
+)
+
+train_pred, test_pred, cv_clf = run_model_cv(
+    clf, KFold(n_splits=5),
+    train.drop(['编号', '患有糖尿病标识'], axis=1),#去掉某几列
+    train['患有糖尿病标识'],
+    test.drop(['编号'], axis=1),
+)
+
+print((train_pred.argmax(1) == train['患有糖尿病标识']).mean())
+test['label'] = test_pred.argmax(1)
+test.rename({'编号': 'uuid'}, axis=1)[['uuid', 'label']].to_csv('../model/result.csv', index=None)
